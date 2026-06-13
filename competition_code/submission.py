@@ -74,6 +74,7 @@ class RoarCompetitionSolution:
         vehicle_velocity = self.velocity_sensor.get_last_gym_observation()
         vehicle_velocity_norm = np.linalg.norm(vehicle_velocity)
         
+        """
         # Find the waypoint closest to the vehicle
         self.current_waypoint_idx = filter_waypoints(
             vehicle_location,
@@ -109,3 +110,6 @@ class RoarCompetitionSolution:
         }
         await self.vehicle.apply_action(control)
         return control
+        """
+
+        

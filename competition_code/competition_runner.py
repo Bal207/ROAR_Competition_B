@@ -121,7 +121,7 @@ async def evaluate_solution(
     # Spawn vehicle and sensors to receive data
     waypoints = world.maneuverable_waypoints
     vehicle = world.spawn_vehicle(
-        "vehicle.tesla.model3",
+        "vehicle.dallara.dallara",
         waypoints[0].location + np.array([0,0,1]),
         waypoints[0].roll_pitch_yaw,
         True,
