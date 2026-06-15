@@ -194,15 +194,15 @@ def _lap_time(v, seg):
 class RoarCompetitionSolution:
 
     # ----- TUNING -----------------------------------------------------------
-    A_LAT   = 20.0   # max lateral accel [m/s^2] == grip.  >>> THE speed knob.
+    A_LAT   = 22.0   # max lateral accel [m/s^2] == grip.  >>> THE speed knob.
     GRIP_MARGIN = 0.90 # Plan corners at 90% limit to give the tracker a physical buffer
     
     STEER_KP = 2    # steering response. VALID RANGE ~1-4. delta is already a
                     #   pure-pursuit angle in radians, so this is a small calibration.
     STEER_SIGN = -1.0  # this sim: steer<0 = LEFT.
 
-    A_ACCEL = 10.0    # max forward accel [m/s^2]
-    A_BRAKE = 30.0   # max braking decel [m/s^2]
+    A_ACCEL = 15.0    # max forward accel [m/s^2]
+    A_BRAKE = 15.0   # max braking decel [m/s^2]
     V_MAX   = 105.0  # top-speed cap [m/s]
     K_DF    = 0.0    # downforce grip
 
@@ -213,7 +213,7 @@ class RoarCompetitionSolution:
     DS_TRACK   = 1.0       # tracking-grid spacing [m]
     
     # --- BOUNDARY SAFETY ---
-    LANE_MARGIN = 4.0             # Base margin from track edge [m]
+    LANE_MARGIN = 3.7             # Base margin from track edge [m]
     TIGHT_CORNER_MARGIN_K = 30.0  # Multiplier to push line away from the apex in hairpins.
                                   # Compensates for Pure Pursuit cutting + rear-wheel drag.
     
@@ -221,7 +221,7 @@ class RoarCompetitionSolution:
 
     # pure pursuit -- lookahead shrinks in corners so tight turns steer sharper
     WHEELBASE = 2.7
-    LD_K   =  1           # lookahead = LD_K * speed ...
+    LD_K   =  0.3         # lookahead = LD_K * speed ...
     LD_MIN = 5.0
     LD_MAX = 22         # ... clamped here. Lower LD_MAX = sharper cornering.
 
