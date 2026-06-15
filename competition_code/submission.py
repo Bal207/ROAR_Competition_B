@@ -144,45 +144,71 @@ def _velocity_profile(path, A_LAT, A_ACCEL, A_BRAKE, V_MAX, K_DF, curv_win, pass
     seg = np.maximum(np.linalg.norm(np.roll(path, -1, axis=0) - path, axis=1), 1e-3)
     n = len(path)
 
+    # Apex speed cap with downforce: a_lat_max(v) = A_LAT + K_DF*v^2, so the
+    # steady-state corner limit v^2*ks <= A_LAT + K_DF*v^2  ->  v = sqrt(A_LAT/(ks-K_DF)).
     denom = np.maximum(ks - K_DF, 1e-4)
     v = np.minimum(np.sqrt(A_LAT / denom), V_MAX)
 
     for _ in range(passes):
+        # backward (braking-limited)
         for i in range(n - 1, -1, -1):
             j = (i + 1) % n
-            a_lat = min(v[i]**2 * ks[i], A_LAT)
-            a_lon = A_BRAKE * np.sqrt(max(0.0, 1.0 - (a_lat/A_LAT)**2))
+            g_lat = A_LAT + K_DF * v[i]**2          # grip available at this speed
+            a_lat = min(v[i]**2 * ks[i], g_lat)
+            a_lon = A_BRAKE * np.sqrt(max(0.0, 1.0 - (a_lat/g_lat)**2))
             v[i] = min(v[i], np.sqrt(v[j]**2 + 2*a_lon*seg[i]))
+        # forward (traction-limited)
         for i in range(n):
             j = (i + 1) % n
-            a_lat = min(v[i]**2 * ks[i], A_LAT)
-            a_lon = A_ACCEL * np.sqrt(max(0.0, 1.0 - (a_lat/A_LAT)**2))
+            g_lat = A_LAT + K_DF * v[i]**2
+            a_lat = min(v[i]**2 * ks[i], g_lat)
+            a_lon = A_ACCEL * np.sqrt(max(0.0, 1.0 - (a_lat/g_lat)**2))
             v[j] = min(v[j], np.sqrt(v[i]**2 + 2*a_lon*seg[i]))
     return v, seg, ks
 
 # =============================================================================
-#  ROBUST LOCAL-FRAME TRACKING SOLUTION FOR TESLA MODEL 3
+#  ROBUST LOCAL-FRAME TRACKING SOLUTION FOR THE TESLA MODEL 3 (road car)
 # =============================================================================
 class RoarCompetitionSolution:
 
-    # ----- CARLA TESLA MODEL 3 PHYSICALLY DERIVED CONSTANTS ------------------
-    A_LAT       = 10.1     # Max lateral tire grip (~1.03G)
-    GRIP_MARGIN = 0.95
-    A_ACCEL     = 7.5      # Smooth electric motor torque ramp
-    A_BRAKE     = 11.8     # ABS brake limit allocation
-    V_MAX       = 72.2     # 260 km/h cap
-    K_DF        = 0.0
+    # ----- TESLA MODEL 3 PHYSICS — CALIBRATE FROM TELEMETRY ------------------
+    # The car is a road car: ~1 g grip, NO aerodynamic downforce (K_DF = 0),
+    # modest power. Lateral grip is essentially constant with speed:
+    #       a_lat_max(v) = A_LAT  (+ K_DF*v^2, but K_DF = 0 here)
+    # These are realistic seeds. Run once with TELEMETRY, read the printed
+    # "first slip" lateral g and top speed, set A_LAT ~= 0.95 * (slip g) and
+    # V_MAX ~= measured top speed, then nudge A_ACCEL / A_BRAKE to match.
+    # NOTE ON CALIBRATION: the planner caps lateral accel at A_LAT*GRIP_MARGIN.
+    # The telemetry "peak lat" only equals the TRUE grip when the plan over-asks
+    # and the car slides - otherwise it just reports this cap. So do NOT lower
+    # A_LAT to the reported peak. Instead, hold A_LAT here and sweep GRIP_MARGIN
+    # UP run by run until the car starts running wide; that finds the real edge.
+    # Your original completed 486 s at a 9.6 cap without crashing, so real grip
+    # is at least that - these values sit just above the proven-safe point.
+    A_LAT       = 11.0     # believed grip ceiling (>= the proven-safe 9.6)
+    K_DF        = 0.0      # road car: no downforce
+    A_ACCEL     = 8.0      # restored above original 7.5
+    A_BRAKE     = 11.0     # ~original 11.8; lower if it runs deep into entries
+    V_MAX       = 72.0     # car reaches ~70.2 m/s, cap is about right
+    GRIP_MARGIN = 2.05    # <-- THE ONE TUNING KNOB. Sweep UP (0.90, 0.95, 1.0,
+                           #     1.05...) until the car runs wide, then back off one step.
 
     DS_OPT      = 2.0
     DS_TRACK    = 0.5
     CURV_WIN_M  = 5.0
-    WHEELBASE   = 2.875    # Exact Tesla Model 3 Wheelbase
+    WHEELBASE   = 2.875    # Tesla Model 3 wheelbase
+
+    # Set True for one run to print peak achieved lateral g / top speed, then
+    # use those numbers to calibrate A_LAT, K_DF and V_MAX above.
+    TELEMETRY   = True
 
     # ----- SYSTEM GAINS -----------------------------------------------------
     STANLEY_K       = 1.2
     STANLEY_K_SOFT  = 3.0
     PID_KP          = 2.0
     PID_KI          = 0.1
+    ACTUATOR_LAG_S  = 0.4   # lookahead time for sim/actuator lag only (NOT a
+                            # braking horizon - the v-profile already brakes in time)
 
     # ----- CORRIDOR MARGIN --------------------------------------------------
     # Constant physical clearance only (does NOT grow with curvature).
@@ -328,10 +354,13 @@ class RoarCompetitionSolution:
 
         steer = float(np.clip(steer_angle, -1.0, 1.0))
 
-        # 4. Long-Range Velocity Horizon Lookahead
+        # 4. Actuator-lag lookahead (NOT a braking horizon)
+        # v_profile[idx] already encodes the correct brake-in-time speed here, so
+        # we only scan ~one lag time ahead to issue commands on time. A long
+        # horizon would re-apply the backward pass's braking and brake far early.
         look = self.idx
         d_ahead = 0.0
-        horizon = max(speed * 0.85, 10.0)
+        horizon = max(speed * self.ACTUATOR_LAG_S, 2.0)
         v_target = self.v_profile[self.idx]
 
         for _ in range(n):
@@ -341,15 +370,16 @@ class RoarCompetitionSolution:
             look = (look + 1) % n
             v_target = min(v_target, self.v_profile[look])
 
-        # 5. Active Traction Control Allocation
+        # 5. Active Traction Control Allocation (friction circle)
+        # Longitudinal grip left over after lateral use: fraction = sqrt(1 - (a_lat/g)^2).
+        # This engages smoothly as you approach the limit instead of snapping to 0,
+        # and - critically - it actually binds at a Model 3's real ~1 g, so corner
+        # exits are traction-managed rather than just flooring an impossible target.
         local_curvature = self.curvature[self.idx]
         current_a_lat = (speed ** 2) * local_curvature
-
-        grip_margin = self.A_LAT - current_a_lat
-        if grip_margin < 2.0:
-            max_throttle_allowed = max(0.0, grip_margin / 2.0)
-        else:
-            max_throttle_allowed = 1.0
+        g_lat = self.A_LAT + self.K_DF * speed ** 2     # grip available at this speed
+        lat_ratio = np.clip(current_a_lat / max(g_lat, 1e-3), 0.0, 1.0)
+        max_throttle_allowed = float(np.sqrt(max(0.0, 1.0 - lat_ratio ** 2)))
 
         # 6. Feedforward + PI Execution
         dv = v_target - speed
@@ -378,4 +408,34 @@ class RoarCompetitionSolution:
             "target_gear": 0,
         }
         await self.vehicle.apply_action(control)
+
+        # ----- TELEMETRY: read real grip / top speed / long. accel off one run --
+        if self.TELEMETRY:
+            a_lat_now = (speed ** 2) * abs(local_curvature)
+            self._t_n = getattr(self, "_t_n", 0) + 1
+            self._t_vmax = max(getattr(self, "_t_vmax", 0.0), speed)
+            self._t_amax = max(getattr(self, "_t_amax", 0.0), a_lat_now)
+            # Longitudinal accel/decel from speed delta (control step ~0.05 s).
+            dt = 0.05
+            prev_v = getattr(self, "_t_prev_v", speed)
+            a_lon_now = (speed - prev_v) / dt
+            self._t_prev_v = speed
+            # Only trust accel readings taken at low lateral load (near-straight),
+            # so cornering scrub isn't mistaken for the engine/brake limit.
+            if a_lat_now < 3.0 and self._t_n > 20:
+                self._t_accel = max(getattr(self, "_t_accel", 0.0), a_lon_now)
+                self._t_brake = max(getattr(self, "_t_brake", 0.0), -a_lon_now)
+            # crosstrack blowing up while at high lateral load = sliding/at-limit
+            if abs(crosstrack_error) > 1.5 and a_lat_now > getattr(self, "_t_slip_a", 0.0):
+                self._t_slip_a = a_lat_now
+                self._t_slip_v = speed
+            if self._t_n % 200 == 0:
+                slip_a = getattr(self, "_t_slip_a", float("nan"))
+                slip_v = getattr(self, "_t_slip_v", float("nan"))
+                accel = getattr(self, "_t_accel", float("nan"))
+                brake = getattr(self, "_t_brake", float("nan"))
+                print(f"[TELEMETRY] top {self._t_vmax:5.1f} m/s | "
+                      f"peak lat {self._t_amax:4.1f} ({self._t_amax/9.81:4.2f}g) | "
+                      f"slip ~{slip_a:4.1f} @ {slip_v:4.1f} m/s | "
+                      f"accel {accel:4.1f} | brake {brake:4.1f} m/s^2")
         return control
