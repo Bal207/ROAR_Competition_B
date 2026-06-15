@@ -187,8 +187,8 @@ class RoarCompetitionSolution:
     # is at least that - these values sit just above the proven-safe point.
     A_LAT       = 13.0     # believed grip ceiling (>= the proven-safe 9.6)
     K_DF        = 0.0      # road car: no downforce
-    A_ACCEL     = 25.0      # restored above original 7.5
-    A_BRAKE     = 17.3     # ~original 11.8; lower if it runs deep into entries
+    A_ACCEL     = 200.0      # restored above original 7.5
+    A_BRAKE     = 30.3     # ~original 11.8; lower if it runs deep into entries
     V_MAX       = 300.0     # car reaches ~70.2 m/s, cap is about right
     GRIP_MARGIN = 2.05    # <-- THE ONE TUNING KNOB. Sweep UP (0.90, 0.95, 1.0,
                            #     1.05...) until the car runs wide, then back off one step.
@@ -204,8 +204,8 @@ class RoarCompetitionSolution:
 
     # ----- SYSTEM GAINS -----------------------------------------------------
     STANLEY_K       = 1.2
-    STANLEY_K_SOFT  = 3.0
-    PID_KP          = 2.0
+    STANLEY_K_SOFT  = 4
+    PID_KP          = 128
     PID_KI          = 0.1
     ACTUATOR_LAG_S  = 0.4   # lookahead time for sim/actuator lag only (NOT a
                             # braking horizon - the v-profile already brakes in time)

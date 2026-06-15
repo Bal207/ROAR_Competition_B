@@ -83,21 +83,6 @@ class RoarCompetitionRule:
     async def respawn(
         self
     ):
-        # vehicle_location = self.vehicle.get_3d_location()
-        # 
-        # closest_waypoint_dist = np.inf
-        # closest_waypoint_idx = 0
-        # for i,waypoint in enumerate(self.waypoints):
-        #     waypoint_dist = np.linalg.norm(vehicle_location - waypoint.location)
-        #     if waypoint_dist < closest_waypoint_dist:
-        #         closest_waypoint_dist = waypoint_dist
-        #         closest_waypoint_idx = i
-        # closest_waypoint = self.waypoints[closest_waypoint_idx]
-        # closest_waypoint_location = closest_waypoint.location
-        # closest_waypoint_rpy = closest_waypoint.roll_pitch_yaw
-        # self.vehicle.set_transform(
-        #     closest_waypoint_location + self.vehicle.bounding_box.extent[2] + 0.2, closest_waypoint_rpy
-        # )
         self.vehicle.set_transform(
             self._respawn_location, self._respawn_rpy
         )
@@ -173,8 +158,9 @@ async def evaluate_solution(
         await world.step()
     
     rule.initialize_race()
-    # vehicle.close()
-    # exit()
+
+    total_waypoints = len(rule.waypoints)
+    per_lap = max(1, total_waypoints // 3)
 
     # Timer starts here 
     start_time = world.last_tick_elapsed_seconds
@@ -206,12 +192,38 @@ async def evaluate_solution(
         if rule.lap_finished():
             break
         
+        # Step the solution first so the dashboard shows the command issued
+        # for THIS frame.
+        control = await solution.step()
+        control = control if isinstance(control, dict) else {}
+
         if enable_visualization:
-            if viewer.render(camera.get_last_observation()) is None:
+            speed = float(np.linalg.norm(
+                np.asarray(velocity_sensor.get_last_gym_observation())))
+            cp = rule.furthest_waypoints_index
+
+            telemetry = {
+                "throttle"        : float(control.get("throttle", 0.0)),
+                "brake"           : float(control.get("brake", 0.0)),
+                "steer"           : float(control.get("steer", 0.0)),
+                "speed"           : speed,
+                "checkpoint"      : cp,
+                "total_waypoints" : total_waypoints,
+                "lap"             : min(3, cp // per_lap + 1),
+                "total_laps"      : 3,
+                "elapsed"         : current_time - start_time,
+                "collision"       : float(collision_impulse_norm),
+            }
+            # Optional extras the solution can publish (e.g. target_speed, lat_g)
+            # by setting `self.telemetry = {...}` at the end of its step().
+            extra = getattr(solution, "telemetry", None)
+            if isinstance(extra, dict):
+                telemetry.update(extra)
+
+            if viewer.render(camera.get_last_observation(), telemetry=telemetry) is None:
                 vehicle.close()
                 return None
 
-        await solution.step()
         await world.step()
     
     print("end of the loop")
