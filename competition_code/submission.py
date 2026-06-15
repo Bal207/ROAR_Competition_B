@@ -203,9 +203,9 @@ class RoarCompetitionSolution:
     TELEMETRY   = True
 
     # ----- SYSTEM GAINS -----------------------------------------------------
-    STANLEY_K       = 1.2
-    STANLEY_K_SOFT  = 4
-    PID_KP          = 128
+    STANLEY_K       = 5
+    STANLEY_K_SOFT  = 2
+    PID_KP          = 256
     PID_KI          = 0.1
     ACTUATOR_LAG_S  = 0.4   # lookahead time for sim/actuator lag only (NOT a
                             # braking horizon - the v-profile already brakes in time)
@@ -377,7 +377,7 @@ class RoarCompetitionSolution:
         # exits are traction-managed rather than just flooring an impossible target.
         local_curvature = self.curvature[self.idx]
         current_a_lat = (speed ** 2) * local_curvature
-        g_lat = self.A_LAT + self.K_DF * speed ** 2     # grip available at this speed
+        g_lat = self.GRIP_MARGIN * (self.A_LAT + self.K_DF * speed ** 2)    # grip available at this speed
         lat_ratio = np.clip(current_a_lat / max(g_lat, 1e-3), 0.0, 1.0)
         max_throttle_allowed = float(np.sqrt(max(0.0, 1.0 - lat_ratio ** 2)))
 
