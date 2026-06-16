@@ -146,7 +146,7 @@ async def evaluate_solution(
 ) -> Optional[Dict[str, Any]]:
     if enable_visualization:
         viewer = ManualControlViewer()
-    
+
     # Spawn vehicle and sensors to receive data
     waypoints = world.maneuverable_waypoints
     vehicle = world.spawn_vehicle(
@@ -306,22 +306,33 @@ async def main():
     carla_client.set_timeout(5.0)
     roar_py_instance = roar_py_carla.RoarPyCarlaInstance(carla_client)
     world = roar_py_instance.world
-    world.set_control_steps(0.05, 0.005)
-    world.set_asynchronous(False)
-
-    # Native CARLA world handle used only for ground-debug drawing of the line.
+    
+    # 1. PHYSICS CLOCK: Lock the simulation step to 0.05s (20 ticks per physics second)
+    # The arguments are usually (physics_step, sensor_step). Keep them matched.
+    world.set_control_steps(0.05, 0.05) 
+    world.set_asynchronous(False)  # This forces Synchronous mode
+    
     try:
         debug_world = carla_client.get_world()
+        
+        # 2. SERVER RENDERING: Kill the Unreal Engine graphics rendering
+        # This prevents your GPU from wasting time drawing shadows and textures
+        settings = debug_world.get_settings()
+        settings.no_rendering_mode = True
+        debug_world.apply_settings(settings)
+        
     except Exception:
         debug_world = None
 
+    # 3. CLIENT RENDERING: Turn off the local pygame/open3d visualization window
     evaluation_result = await evaluate_solution(
         world,
         RoarCompetitionSolution,
         max_seconds=5000,
-        enable_visualization=True,
+        enable_visualization=False,  # Set to False so it runs headlessly
         debug_world=debug_world,
     )
+    
     if evaluation_result is not None:
         print("Solution finished in {} seconds".format(evaluation_result["elapsed_time"]))
     else:
