@@ -7,15 +7,13 @@ import roar_py_interface
 # =============================================================================
 #  AUTOTUNER HOOK
 #  The optimizer sets `submission.OVERRIDES = {...}` before constructing the
-#  solution. Any name listed in TUNABLE is read from here, falling back to the
-#  class default. This file is also a valid standalone submission: with
-#  OVERRIDES empty it runs the proven baseline.
+#  solution. Any name in TUNABLE is read from here, falling back to the class
+#  default. With OVERRIDES empty this runs the in-file baseline / SECTION_PARAMS.
 # =============================================================================
 OVERRIDES: Dict[str, float] = {}
 
 TUNABLE = [
-    "GRIP_MARGIN", "THROTTLE_GRIP_MARGIN", "K_DF", "K_DF_BRAKE",
-    "A_BRAKE", "A_ACCEL", "V_MAX",
+    "GRIP_MARGIN", "K_DF", "A_BRAKE", "A_ACCEL", "V_MAX",
     "STANLEY_K", "STANLEY_K_SOFT", "PID_KP", "PID_KI", "ACTUATOR_LAG_S",
     "SAFETY_BUFFER", "CURV_WIN_M",
 ]
@@ -24,7 +22,7 @@ def normalize_rad(rad: float):
     return (rad + np.pi) % (2 * np.pi) - np.pi
 
 # =============================================================================
-#  GEOMETRY & TRAJECTORY OPTIMIZATION HELPERS  (unchanged, proven)
+#  GEOMETRY & TRAJECTORY OPTIMIZATION HELPERS
 # =============================================================================
 def _resample_closed(points: np.ndarray, ds: float) -> np.ndarray:
     loop = np.vstack([points, points[:1]])
@@ -122,23 +120,34 @@ def _min_curvature_offsets(center, normal0, half_width, n_iter=4, reg_smooth=0.0
     return alpha
 
 def _velocity_profile(path, A_LAT, A_ACCEL, A_BRAKE, V_MAX, K_DF, curv_win, passes=5):
+    """
+    Forward/backward speed-limit pass. Each grip/accel argument may be a SCALAR
+    or a PER-POINT ARRAY (length == len(path)); arrays let the limits differ by
+    lap section. Scalars are broadcast, so this works either way.
+    """
+    n = len(path)
+    A_LAT   = np.broadcast_to(np.asarray(A_LAT, float),   (n,)).copy()
+    A_ACCEL = np.broadcast_to(np.asarray(A_ACCEL, float), (n,)).copy()
+    A_BRAKE = np.broadcast_to(np.asarray(A_BRAKE, float), (n,)).copy()
+    V_MAX   = np.broadcast_to(np.asarray(V_MAX, float),   (n,)).copy()
+    K_DF    = np.broadcast_to(np.asarray(K_DF, float),    (n,)).copy()
+
     kappa = _windowed_curvature(path, curv_win)
     ks = 0.25*np.roll(kappa, 1) + 0.5*kappa + 0.25*np.roll(kappa, -1)
     seg = np.maximum(np.linalg.norm(np.roll(path, -1, axis=0) - path, axis=1), 1e-3)
-    n = len(path)
 
-    # Apex speed cap with downforce: a_lat_max(v) = A_LAT + K_DF*v^2, so the
-    # steady-state corner limit v^2*ks <= A_LAT + K_DF*v^2  ->  v = sqrt(A_LAT/(ks-K_DF)).
+    # Apex cap with downforce: v^2*ks <= A_LAT + K_DF*v^2 -> v = sqrt(A_LAT/(ks-K_DF)).
     denom = np.maximum(ks - K_DF, 1e-4)
     v = np.minimum(np.sqrt(A_LAT / denom), V_MAX)
+
     for _ in range(passes):
-        for i in range(n - 1, -1, -1):
+        for i in range(n - 1, -1, -1):                # backward (braking-limited)
             j = (i + 1) % n
-            g_lat = A_LAT[i] + K_DF[i] * v[i]**2        # grip available at this speed
+            g_lat = A_LAT[i] + K_DF[i] * v[i]**2
             a_lat = min(v[i]**2 * ks[i], g_lat)
-            a_lon = A_BRAKE * np.sqrt(max(0.0, 1.0 - (a_lat/g_lat)**2))
+            a_lon = A_BRAKE[i] * np.sqrt(max(0.0, 1.0 - (a_lat/g_lat)**2))
             v[i] = min(v[i], np.sqrt(v[j]**2 + 2*a_lon*seg[i]))
-        for i in range(n):
+        for i in range(n):                            # forward (traction-limited)
             j = (i + 1) % n
             g_lat = A_LAT[i] + K_DF[i] * v[i]**2
             a_lat = min(v[i]**2 * ks[i], g_lat)
@@ -147,45 +156,28 @@ def _velocity_profile(path, A_LAT, A_ACCEL, A_BRAKE, V_MAX, K_DF, curv_win, pass
     return v, seg, ks
 
 # =============================================================================
-#  ROBUST LOCAL-FRAME TRACKING SOLUTION FOR THE TESLA MODEL 3 (road car)
+#  SOLUTION  (Dallara) — per-section gains, sector timing, autotuner hook
 # =============================================================================
 class RoarCompetitionSolution:
 
-    # ----- TESLA MODEL 3 PHYSICS — CALIBRATE FROM TELEMETRY ------------------
-    # The car is a road car: ~1 g grip, NO aerodynamic downforce (K_DF = 0),
-    # modest power. Lateral grip is essentially constant with speed:
-    #       a_lat_max(v) = A_LAT  (+ K_DF*v^2, but K_DF = 0 here)
-    # These are realistic seeds. Run once with TELEMETRY, read the printed
-    # "first slip" lateral g and top speed, set A_LAT ~= 0.95 * (slip g) and
-    # V_MAX ~= measured top speed, then nudge A_ACCEL / A_BRAKE to match.
-    # NOTE ON CALIBRATION: the planner caps lateral accel at A_LAT*GRIP_MARGIN.
-    # The telemetry "peak lat" only equals the TRUE grip when the plan over-asks
-    # and the car slides - otherwise it just reports this cap. So do NOT lower
-    # A_LAT to the reported peak. Instead, hold A_LAT here and sweep GRIP_MARGIN
-    # UP run by run until the car starts running wide; that finds the real edge.
-    # Your original completed 486 s at a 9.6 cap without crashing, so real grip
-    # is at least that - these values sit just above the proven-safe point.
-    A_LAT       = 13.0     # believed grip ceiling (>= the proven-safe 9.6)
-    K_DF        = 0.0      # road car: no downforce
-    A_ACCEL     = 200.0      # restored above original 7.5
-    A_BRAKE     = 30.3     # ~original 11.8; lower if it runs deep into entries
-    V_MAX       = 300.0     # car reaches ~70.2 m/s, cap is about right
-    GRIP_MARGIN = 2.05    # <-- THE ONE TUNING KNOB. Sweep UP (0.90, 0.95, 1.0,
-                           #     1.05...) until the car runs wide, then back off one step.
+    # ----- PHYSICS / SPEED (scalar defaults; sections override below) --------
+    A_LAT       = 13.0
+    K_DF        = 0.0
+    A_ACCEL     = 200.0
+    A_BRAKE     = 30.3
+    V_MAX       = 300.0
+    GRIP_MARGIN = 2.05
 
     DS_OPT      = 2.0
     DS_TRACK    = 0.5
     CURV_WIN_M  = 5.0
-    WHEELBASE   = 2.875    # Tesla Model 3 wheelbase
-
-    # Set True for one run to print peak achieved lateral g / top speed, then
-    # use those numbers to calibrate A_LAT, K_DF and V_MAX above.
+    WHEELBASE   = 2.875
     TELEMETRY   = True
 
-    # ----- SYSTEM GAINS -----------------------------------------------------
-    STANLEY_K       = 5
-    STANLEY_K_SOFT  = 2
-    PID_KP          = 256
+    # ----- CONTROLLER GAINS -------------------------------------------------
+    STANLEY_K       = 5.0
+    STANLEY_K_SOFT  = 2.0
+    PID_KP          = 256.0
     PID_KI          = 0.1
     ACTUATOR_LAG_S  = 0.4
 
@@ -193,47 +185,31 @@ class RoarCompetitionSolution:
     CAR_HALF_WIDTH = 0.95
     SAFETY_BUFFER  = 0.65
     LANE_MARGIN    = CAR_HALF_WIDTH + SAFETY_BUFFER
-
-    # Geometric guard: never offset inward past a fraction of the local radius
-    # of curvature, or the inside of the corridor self-intersects. Generous on
-    # purpose - only binds below ~R=4-5 m, so normal corners are untouched.
     MAX_OFFSET_RADIUS_FRAC = 0.7
     SMOOTH_WIN_M = 1.5
 
     # =========================================================================
     #  PER-SECTION TUNING
-    #  The lap is split into N_SECTIONS equal-distance sections (by arc length
-    #  along the racing line). For any knob below, give a list of N_SECTIONS
-    #  values and that knob takes the section's value instead of the scalar
-    #  default. Leave a knob out (or the whole dict empty) to use scalars
-    #  everywhere -> identical to the single-value baseline.
-    #
-    #  Supported names:
+    #  Lap split into N_SECTIONS equal-distance sections (by arc length on the
+    #  racing line). For any knob, give a list of N_SECTIONS values; omit it to
+    #  use the scalar default. Supported:
     #    plan-time : GRIP_MARGIN, A_LAT, K_DF, A_BRAKE, A_ACCEL, V_MAX
     #    live ctrl : STANLEY_K, STANLEY_K_SOFT, PID_KP, PID_KI, ACTUATOR_LAG_S
-    #  (GRIP_MARGIN/A_LAT/K_DF affect both the plan and the throttle limiter.)
-    #
-    #  Section numbers printed at startup tell you the metre range of each.
+    #  Startup prints each section's metre range; the lap printout gives splits.
     # =========================================================================
     N_SECTIONS = 5
     SECTION_PARAMS: Dict[str, list] = {
-        #                S1     S2     S3     S4     S5
-        # "STANLEY_K":   [5.0,  5.0,  1.5,  5.0,  3.0],
-        # "GRIP_MARGIN": [2.05, 2.05, 1.8,  2.05, 2.0],
-        # "A_BRAKE":     [30.3, 30.3, 26.0, 30.3, 30.3],
-        "A_LAT":       [15, 16.0, 16, 15, 15.5],
-        "K_DF":        [0.0,  0.0,  0.00, 0.0,  0.00],
-        "A_ACCEL":     [200.0, 200.0, 200.0, 200.0, 200.0],
-        "V_MAX":       [300.0, 300.0, 200.0, 300.0, 300.0],
-        "GRIP_MARGIN": [1.95, 2.1, 1.7, 2.75, 2.3],
-        "STANLEY_K":   [5.0,  3.0,  1.5,  3.0,  3.0],
-        "STANLEY_K_SOFT": [4.0, 2.0, 2.0, 4.0, 1.5],
-        "PID_KP":      [256.0, 256.0, 128.0, 256.0, 200.0],
-        "PID_KI":      [0.5, 0.5, 0.5, 0.5, 0.5],
-        "ACTUATOR_LAG_S": [0.38, 0.38, 0.38, 0.38, 0.35],
-   
-    
-
+        #                  S1     S2     S3     S4     S5
+        "A_LAT":          [18.0,  16.0,  18.0,  18.0,  18.5],
+        "K_DF":           [0.0,   0.0,   0.0,   0.0,   0.0],
+        "A_ACCEL":        [1000.0, 1000.0, 1000.0, 1000.0, 1000.0],
+        "V_MAX":          [300.0, 300.0, 200.0, 300.0, 300.0],
+        "GRIP_MARGIN":    [1.8,  2.2,  1.6,  2.3,  2.30],
+        "STANLEY_K":      [5.0,   3.0,   4,   3.0,   3.0],
+        "STANLEY_K_SOFT": [4.0,   2.0,   3.0,   4.0,   1.5],
+        "PID_KP":         [256.0, 256.0, 128.0, 256.0, 200.0],
+        "PID_KI":         [0.5,   0.5,   0.5,   0.5,   0.5],
+        "ACTUATOR_LAG_S": [0.38,  0.38,  0.38,  0.38,  0.38],
     }
 
     CONTROL_DT = 0.05   # sim seconds per control step (matches the runner)
@@ -256,6 +232,19 @@ class RoarCompetitionSolution:
         self.rpy_sensor = rpy_sensor
         self.integral_error = 0.0
         self.idx = 0
+        self.telemetry = {}
+        # Apply autotuner overrides (instance attrs shadow class defaults).
+        for name in TUNABLE:
+            if name in OVERRIDES:
+                setattr(self, name, float(OVERRIDES[name]))
+        self.LANE_MARGIN = self.CAR_HALF_WIDTH + self.SAFETY_BUFFER
+
+    # Per-section scalar lookup.
+    def _sec(self, name, sec):
+        vals = self.SECTION_PARAMS.get(name)
+        if vals is None:
+            return float(getattr(self, name))
+        return float(vals[int(sec)])
 
     async def initialize(self) -> None:
         wps = self.maneuverable_waypoints
@@ -263,7 +252,6 @@ class RoarCompetitionSolution:
         center_raw = center_raw_3d[:, :2]
         width_raw = np.array([float(getattr(w, "lane_width", 6.0)) for w in wps])
 
-        # ----- Coarse grid (solve) and fine grid (track) ---------------------
         center_o_3d = _resample_closed(center_raw_3d, self.DS_OPT)
         center_o = center_o_3d[:, :2]
         width_o = _resample_scalar_closed(width_raw, center_raw, self.DS_OPT)
@@ -282,21 +270,13 @@ class RoarCompetitionSolution:
         kappa_o = _windowed_curvature(center_o, curv_win_o)
         kappa_f = _windowed_curvature(center_f, curv_win_f)
 
-        # ----- Feasible lateral band -----------------------------------------
-        # Constant margin, plus the radius guard so the inside never collapses.
         half_o = np.maximum(width_o / 2.0 - self.LANE_MARGIN, 0.0)
         half_f = np.maximum(width_f / 2.0 - self.LANE_MARGIN, 0.0)
         half_o = np.minimum(half_o, self.MAX_OFFSET_RADIUS_FRAC / (kappa_o + 1e-6))
         half_f = np.minimum(half_f, self.MAX_OFFSET_RADIUS_FRAC / (kappa_f + 1e-6))
 
-        safe_a_lat = self.A_LAT * self.GRIP_MARGIN
-
-        # ----- Iterated minimum-curvature solve on the coarse grid -----------
+        # ----- Racing line (NOT affected by per-section speeds) --------------
         alpha_o = _min_curvature_offsets(center_o, normal_o, half_o)
-
-        # ----- Transfer offsets coarse -> fine in NORMALIZED progress space --
-        # Both grids run 0..1 with an explicit periodic knot, so there's no
-        # perimeter-scale drift and no premature modulo wrap/seam.
         u_o = _progress(center_o)
         u_f = _progress(center_f)
         off_f = np.interp(u_f, np.append(u_o, 1.0), np.append(alpha_o, alpha_o[0]))
@@ -317,7 +297,7 @@ class RoarCompetitionSolution:
                 return np.full(n_fine, base)
             return np.asarray(vals, float)[self.section_of]
 
-        # ----- Per-point plan limits from section values ---------------------
+        # ----- Per-point plan limits from section values --------------------
         A_LAT_arr  = sec_arr("A_LAT")
         GM_arr     = sec_arr("GRIP_MARGIN")
         KDF_arr    = sec_arr("K_DF")
@@ -327,8 +307,7 @@ class RoarCompetitionSolution:
         safe_a_lat = A_LAT_arr * GM_arr
 
         v_opt, s_opt, kappa_opt = _velocity_profile(
-            path_opt, safe_a_lat, self.A_ACCEL, self.A_BRAKE,
-            self.V_MAX, self.K_DF, curv_win_f)
+            path_opt, safe_a_lat, AACCEL_arr, ABRAKE_arr, VMAX_arr, KDF_arr, curv_win_f)
 
         self.path = path_opt
         self.tangent = _tangents_normals(path_opt, smooth_win=0)[0]
@@ -339,6 +318,18 @@ class RoarCompetitionSolution:
 
         loc = np.asarray(self.location_sensor.get_last_gym_observation())[:2]
         self.idx = int(np.argmin(np.linalg.norm(self.path - loc, axis=1)))
+
+        # ----- Sector-timing state -------------------------------------------
+        self._lap_sec_time = np.zeros(self.N_SECTIONS)
+        self._total_sec_time = np.zeros(self.N_SECTIONS)
+        self._last_sec = int(self.section_of[self.idx])
+        self._lap_count = 0
+
+        total_len = float(np.sum(_seg_lengths(path_opt)))
+        bounds = [k * total_len / self.N_SECTIONS for k in range(self.N_SECTIONS + 1)]
+        ranges = "  ".join(f"S{k+1}:{bounds[k]:4.0f}-{bounds[k+1]:4.0f}m"
+                           for k in range(self.N_SECTIONS))
+        print(f"[SECTIONS] lap length {total_len:.0f} m | {ranges}")
 
     @staticmethod
     def _arclen(path):
@@ -351,6 +342,7 @@ class RoarCompetitionSolution:
         speed = float(np.linalg.norm(self.velocity_sensor.get_last_gym_observation()))
         n = len(self.path)
 
+        # 1. Front axle position + nearest path index
         fx = loc[0] + self.WHEELBASE * np.cos(yaw)
         fy = loc[1] + self.WHEELBASE * np.sin(yaw)
         front_axle = np.array([fx, fy])
@@ -360,7 +352,20 @@ class RoarCompetitionSolution:
         wd = np.linalg.norm(win - front_axle, axis=1)
         self.idx = win_ix[int(np.argmin(wd))]
 
-        # 2. Local Vehicle Frame Transformation
+        # 2. This section's gains
+        sec = int(self.section_of[self.idx])
+        stanley_k      = self._sec("STANLEY_K", sec)
+        stanley_k_soft = self._sec("STANLEY_K_SOFT", sec)
+        pid_kp         = self._sec("PID_KP", sec)
+        pid_ki         = self._sec("PID_KI", sec)
+        actuator_lag   = self._sec("ACTUATOR_LAG_S", sec)
+        grip_margin    = self._sec("GRIP_MARGIN", sec)
+        a_lat_c        = self._sec("A_LAT", sec)
+        k_df_c         = self._sec("K_DF", sec)
+        a_accel_c      = self._sec("A_ACCEL", sec)
+        a_brake_c      = self._sec("A_BRAKE", sec)
+
+        # 3. Local frame + Stanley steering
         closest_pt = self.path[self.idx]
         dx = closest_pt[0] - front_axle[0]
         dy = closest_pt[1] - front_axle[1]
@@ -371,17 +376,11 @@ class RoarCompetitionSolution:
         heading_error = normalize_rad(path_yaw - yaw)
         crosstrack_error = local_y
 
-        # 3. Combined Stanley Law Matrix
-        dyn_k = self.STANLEY_K * (1.0 - np.clip(speed / self.V_MAX, 0.0, 0.5))
+        dyn_k = stanley_k * (1.0 - np.clip(speed / self.V_MAX, 0.0, 0.5))
+        raw_steer_angle = heading_error + np.arctan2(dyn_k * crosstrack_error, speed + stanley_k_soft)
+        steer = float(np.clip(-raw_steer_angle, -1.0, 1.0))
 
-        raw_steer_angle = heading_error + np.arctan2(dyn_k * crosstrack_error, speed + self.STANLEY_K_SOFT)
-
-        # FIX APPLIED HERE: Invert the steering mapping.
-        # Standard math outputs a positive angle for Left, but the CARLA actuator expects negative for Left.
-        steer_angle = -raw_steer_angle
-
-        steer = float(np.clip(steer_angle, -1.0, 1.0))
-
+        # 4. Actuator-lag lookahead for target speed
         look = self.idx
         d_ahead = 0.0
         horizon = max(speed * actuator_lag, 2.0)
@@ -393,12 +392,14 @@ class RoarCompetitionSolution:
             look = (look + 1) % n
             v_target = min(v_target, self.v_profile[look])
 
+        # 5. Friction-circle throttle cap
         local_curvature = self.curvature[self.idx]
         current_a_lat = (speed ** 2) * local_curvature
-        g_lat = self.GRIP_MARGIN * (self.A_LAT + self.K_DF * speed ** 2)    # grip available at this speed
+        g_lat = grip_margin * (a_lat_c + k_df_c * speed ** 2)
         lat_ratio = np.clip(current_a_lat / max(g_lat, 1e-3), 0.0, 1.0)
         max_throttle_allowed = float(np.sqrt(max(0.0, 1.0 - lat_ratio ** 2)))
 
+        # 6. Feedforward + PI
         dv = v_target - speed
         self.integral_error += dv * 0.05
         self.integral_error = np.clip(self.integral_error, -4.0, 4.0)
@@ -426,33 +427,33 @@ class RoarCompetitionSolution:
         }
         await self.vehicle.apply_action(control)
 
-        # ----- TELEMETRY: read real grip / top speed / long. accel off one run --
+        # 7. Sector timing -> per-lap breakdown
+        self._lap_sec_time[sec] += self.CONTROL_DT
+        self._total_sec_time[sec] += self.CONTROL_DT
+        if self._last_sec == self.N_SECTIONS - 1 and sec == 0 \
+                and self._lap_sec_time.sum() > 30.0:
+            self._lap_count += 1
+            lap_total = float(self._lap_sec_time.sum())
+            parts = "  ".join(f"S{k+1} {self._lap_sec_time[k]:5.1f}s"
+                              for k in range(self.N_SECTIONS))
+            print(f"[LAP {self._lap_count}] total {lap_total:6.1f}s | {parts}")
+            self._lap_sec_time = np.zeros(self.N_SECTIONS)
+        self._last_sec = sec
+
+        self.telemetry = {
+            "section": sec + 1,
+            "target_speed": float(v_target),
+            "lat_g": float(current_a_lat),
+            "sector_times": [float(x) for x in self._lap_sec_time],
+        }
+
         if self.TELEMETRY:
             a_lat_now = (speed ** 2) * abs(local_curvature)
             self._t_n = getattr(self, "_t_n", 0) + 1
             self._t_vmax = max(getattr(self, "_t_vmax", 0.0), speed)
             self._t_amax = max(getattr(self, "_t_amax", 0.0), a_lat_now)
-            # Longitudinal accel/decel from speed delta (control step ~0.05 s).
-            dt = 0.05
-            prev_v = getattr(self, "_t_prev_v", speed)
-            a_lon_now = (speed - prev_v) / dt
-            self._t_prev_v = speed
-            # Only trust accel readings taken at low lateral load (near-straight),
-            # so cornering scrub isn't mistaken for the engine/brake limit.
-            if a_lat_now < 3.0 and self._t_n > 20:
-                self._t_accel = max(getattr(self, "_t_accel", 0.0), a_lon_now)
-                self._t_brake = max(getattr(self, "_t_brake", 0.0), -a_lon_now)
-            # crosstrack blowing up while at high lateral load = sliding/at-limit
-            if abs(crosstrack_error) > 1.5 and a_lat_now > getattr(self, "_t_slip_a", 0.0):
-                self._t_slip_a = a_lat_now
-                self._t_slip_v = speed
             if self._t_n % 200 == 0:
-                slip_a = getattr(self, "_t_slip_a", float("nan"))
-                slip_v = getattr(self, "_t_slip_v", float("nan"))
-                accel = getattr(self, "_t_accel", float("nan"))
-                brake = getattr(self, "_t_brake", float("nan"))
-                print(f"[TELEMETRY] top {self._t_vmax:5.1f} m/s | "
-                      f"peak lat {self._t_amax:4.1f} ({self._t_amax/9.81:4.2f}g) | "
-                      f"slip ~{slip_a:4.1f} @ {slip_v:4.1f} m/s | "
-                      f"accel {accel:4.1f} | brake {brake:4.1f} m/s^2")
+                pass
+                #print(f"[TELEMETRY] top {self._t_vmax:5.1f} m/s | "
+                      #f"peak lat {self._t_amax:4.1f} ({self._t_amax/9.81:4.2f}g)")
         return control
