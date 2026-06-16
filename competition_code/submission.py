@@ -134,7 +134,7 @@ def _velocity_profile(path, A_LAT, A_ACCEL, A_BRAKE, V_MAX, K_DF, curv_win, pass
     for _ in range(passes):
         for i in range(n - 1, -1, -1):
             j = (i + 1) % n
-            g_lat = A_LAT + K_DF * v[i]**2          # grip available at this speed
+            g_lat = A_LAT[i] + K_DF[i] * v[i]**2        # grip available at this speed
             a_lat = min(v[i]**2 * ks[i], g_lat)
             a_lon = A_BRAKE * np.sqrt(max(0.0, 1.0 - (a_lat/g_lat)**2))
             v[i] = min(v[i], np.sqrt(v[j]**2 + 2*a_lon*seg[i]))
@@ -221,11 +221,11 @@ class RoarCompetitionSolution:
         # "STANLEY_K":   [5.0,  5.0,  1.5,  5.0,  3.0],
         # "GRIP_MARGIN": [2.05, 2.05, 1.8,  2.05, 2.0],
         # "A_BRAKE":     [30.3, 30.3, 26.0, 30.3, 30.3],
-        "A_LAT":       [14.5, 16.0, 15, 15, 15.5],
+        "A_LAT":       [15, 16.0, 16, 15, 15.5],
         "K_DF":        [0.0,  0.0,  0.00, 0.0,  0.00],
         "A_ACCEL":     [200.0, 200.0, 200.0, 200.0, 200.0],
-        "V_MAX":       [300.0, 300.0, 200.0, 300.0, 250.0],
-        "GRIP_MARGIN": [2.05, 2.1, 1.8, 2.75, 2.3],
+        "V_MAX":       [300.0, 300.0, 200.0, 300.0, 300.0],
+        "GRIP_MARGIN": [1.95, 2.1, 1.7, 2.75, 2.3],
         "STANLEY_K":   [5.0,  3.0,  1.5,  3.0,  3.0],
         "STANLEY_K_SOFT": [4.0, 2.0, 2.0, 4.0, 1.5],
         "PID_KP":      [256.0, 256.0, 128.0, 256.0, 200.0],
