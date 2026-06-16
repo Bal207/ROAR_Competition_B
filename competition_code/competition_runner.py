@@ -121,7 +121,7 @@ class RoarCompetitionRule:
         
         self.furthest_waypoints_index += min_index
         self._last_vehicle_location = current_location
-        print(f"reach waypoints {self.furthest_waypoints_index} at {self.waypoints[self.furthest_waypoints_index].location}")
+        #print(f"reach waypoints {self.furthest_waypoints_index} at {self.waypoints[self.furthest_waypoints_index].location}")
 
     async def respawn(
         self
@@ -215,7 +215,8 @@ async def evaluate_solution(
     # ----- Hand the planned trajectory to the visualizers --------------------
     if enable_visualization and hasattr(solution, "path"):
         try:
-            viewer.set_trajectory(solution.path, solution.v_profile)
+            viewer.set_trajectory(solution.path, solution.v_profile,
+                                  section_of=getattr(solution, "section_of", None))
         except Exception as e:
             print(f"Could not set track map: {e}")
     if debug_world is not None and hasattr(solution, "path_3d"):

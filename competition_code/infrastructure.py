@@ -41,6 +41,8 @@ class ManualControlViewer:
         # ----- track-map state ----------------------------------------------
         self._traj_xy = None
         self._traj_speed = None
+        self._section_of = None
+        self._map_sec_marks = []
         self._map_built = False
         self._map_box = None
         self._breadcrumb = deque(maxlen=260)
@@ -62,11 +64,14 @@ class ManualControlViewer:
         pygame.quit()
 
     # ---------------------------------------------------------- trajectory API
-    def set_trajectory(self, path_xy, speeds) -> None:
+    def set_trajectory(self, path_xy, speeds, section_of=None) -> None:
         """Call once after the solution plans its path. path_xy is (N,2) world XY
-        in the same frame the location sensor reports; speeds is (N,)."""
+        in the same frame the location sensor reports; speeds is (N,). section_of
+        (N,) is the per-point lap-section index (0..N_SECTIONS-1), if available."""
         self._traj_xy = np.asarray(path_xy, dtype=float)[:, :2]
         self._traj_speed = np.asarray(speeds, dtype=float)
+        self._section_of = (np.asarray(section_of).astype(int)
+                            if section_of is not None else None)
         self._map_built = False
 
     @staticmethod
@@ -109,6 +114,32 @@ class ManualControlViewer:
         rng = max(vmax - vmin, 1e-3)
         self._map_px = [self._w2m(xy[i, 0], xy[i, 1]) for i in idxs]
         self._map_col = [self._speed_color((sp[i] - vmin) / rng) for i in idxs]
+
+        # Section boundary markers: a tick + label at the FIRST point of each
+        # section, plus the pixel midpoint of each section for the number.
+        self._map_sec_marks = []
+        so = self._section_of
+        if so is not None and len(so) == n:
+            nsec = int(so.max()) + 1
+            for k in range(nsec):
+                where = np.where(so == k)[0]
+                if len(where) == 0:
+                    continue
+                i0 = int(where[0])                      # boundary = start of section k
+                cx, cy = self._w2m(xy[i0, 0], xy[i0, 1])
+                # tick perpendicular to the local line direction
+                a = self._w2m(xy[(i0 - 2) % n, 0], xy[(i0 - 2) % n, 1])
+                b = self._w2m(xy[(i0 + 2) % n, 0], xy[(i0 + 2) % n, 1])
+                dvx, dvy = b[0] - a[0], b[1] - a[1]
+                dn = (dvx * dvx + dvy * dvy) ** 0.5 or 1.0
+                perp = (-dvy / dn, dvx / dn)
+                tick0 = (cx - perp[0] * 7, cy - perp[1] * 7)
+                tick1 = (cx + perp[0] * 7, cy + perp[1] * 7)
+                # label position: midpoint of the section, nudged off the line
+                mid = where[len(where) // 2]
+                mx, my = self._w2m(xy[mid, 0], xy[mid, 1])
+                self._map_sec_marks.append(
+                    {"sec": k, "dot": (cx, cy), "tick": (tick0, tick1), "label": (mx, my)})
         self._map_built = True
 
     def _draw_car_marker(self, cxy, cyaw):
@@ -143,6 +174,17 @@ class ManualControlViewer:
         if len(self._breadcrumb) > 1:
             bc = [self._w2m(p[0], p[1]) for p in self._breadcrumb]
             pygame.draw.lines(self.screen, (245, 245, 245), False, bc, 1)
+
+        # Section boundaries: white tick + a dot at each split, and an S# label
+        # at each section's middle. The section the car is in is highlighted.
+        cur_sec = t.get("section")
+        for m in self._map_sec_marks:
+            pygame.draw.line(self.screen, (235, 238, 245), m["tick"][0], m["tick"][1], 2)
+            pygame.draw.circle(self.screen, (235, 238, 245), m["dot"], 3)
+            hot = (cur_sec is not None and (m["sec"] + 1) == int(cur_sec))
+            color = self.AMBER if hot else self.MUTED
+            font = self.font_label if hot else self.font_small
+            self._text(f"S{m['sec'] + 1}", m["label"][0] - 6, m["label"][1] - 7, color, font)
 
         cxy = t.get("car_xy")
         if cxy is not None:
